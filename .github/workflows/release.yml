@@ -11,9 +11,9 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset: autoclicker-macos-arm64
+            asset: AutoClicker-macos-arm64.dmg
             target: x86_64-pc-windows-msvc
-            asset: autoclicker-windows-x64.exe
+            asset: AutoClicker-windows-x64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -21,9 +21,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
-      - name: Rename (unix)
-        if: runner.os != 'Windows'
-        run: cp target/${{ matrix.target }}/release/autoclicker ${{ matrix.asset }}
+      - name: Package macOS app (.dmg)
+        if: runner.os == 'macOS'
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          mkdir -p AutoClicker.app/Contents/MacOS
+          cp target/${{ matrix.target }}/release/autoclicker AutoClicker.app/Contents/MacOS/autoclicker
+          sed "s/__VERSION__/$VER/g" packaging/Info.plist > AutoClicker.app/Contents/Info.plist
+          codesign --force --deep -s - AutoClicker.app
+          mkdir dmg && cp -R AutoClicker.app dmg/ && ln -s /Applications dmg/Applications
+          hdiutil create -volname AutoClicker -srcfolder dmg -ov -format UDZO ${{ matrix.asset }}
       - name: Rename (windows)
         if: runner.os == 'Windows'
         run: copy target\${{ matrix.target }}\release\autoclicker.exe ${{ matrix.asset }}

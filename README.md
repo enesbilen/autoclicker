@@ -19,7 +19,7 @@ macOS ve Windows için hızlı, hafif otomatik tıklayıcı. Rust ile yazıldı,
 
 İlk çalıştırmada **Sistem Ayarları → Gizlilik ve Güvenlik** altında uygulamaya (veya Terminal'e)
 **Erişilebilirlik** ve **Girdi İzleme** izni ver. Bu izinler olmadan tıklama ve kısayollar çalışmaz.
-İndirilen dosya engellenirse: `xattr -d com.apple.quarantine ./autoclicker-macos-arm64`
+İlk açılışta engellenirse uygulamaya sağ tıklayıp **Aç** de veya `xattr -dr com.apple.quarantine /Applications/AutoClicker.app` çalıştır.
 
 ## Kaynaktan derleme
 
