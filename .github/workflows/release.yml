@@ -12,6 +12,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: AutoClicker-macos-arm64.dmg
+          - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset: AutoClicker-windows-x64.exe
     runs-on: ${{ matrix.os }}
