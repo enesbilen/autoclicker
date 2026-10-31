@@ -28,6 +28,8 @@ jobs:
           VER="${GITHUB_REF_NAME#v}"
           mkdir -p AutoClicker.app/Contents/MacOS
           cp target/${{ matrix.target }}/release/autoclicker AutoClicker.app/Contents/MacOS/autoclicker
+          mkdir -p AutoClicker.app/Contents/Resources
+          cp assets/icon.icns AutoClicker.app/Contents/Resources/icon.icns
           sed "s/__VERSION__/$VER/g" packaging/Info.plist > AutoClicker.app/Contents/Info.plist
           codesign --force --deep -s - AutoClicker.app
           mkdir dmg && cp -R AutoClicker.app dmg/ && ln -s /Applications dmg/Applications

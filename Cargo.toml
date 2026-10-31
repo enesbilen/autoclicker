@@ -1,6 +1,6 @@
 [package]
 name = "autoclicker"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -17,3 +17,6 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

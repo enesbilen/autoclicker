@@ -14,6 +14,13 @@ enum Mode {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+enum Rep {
+    Infinite,
+    Count,
+    Time,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum Btn {
     Left,
     Right,
@@ -32,9 +39,14 @@ struct Config {
     fixed_pos: bool,
     x: i32,
     y: i32,
-    infinite: bool,
+    rep: Rep,
     repeat: u64,
+    limit_min: u32,
+    limit_sec: u32,
     key_idx: usize,
+    mods: [bool; 4], // ctrl, shift, alt, meta
+    hold_ms: u32,
+    notify: bool,
 }
 
 impl Default for Config {
@@ -50,9 +62,14 @@ impl Default for Config {
             fixed_pos: false,
             x: 0,
             y: 0,
-            infinite: true,
+            rep: Rep::Infinite,
             repeat: 100,
+            limit_min: 5,
+            limit_sec: 0,
             key_idx: 0,
+            mods: [false; 4],
+            hold_ms: 0,
+            notify: true,
         }
     }
 }
@@ -112,6 +129,25 @@ fn key_list() -> Vec<(&'static str, Key)> {
     v
 }
 
+fn notify(count: u64) {
+    use std::process::Command;
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("afplay").arg("/System/Library/Sounds/Glass.aiff").spawn();
+        let msg = format!("display notification \"{count} tıklama tamamlandı\" with title \"AutoClicker\"");
+        let _ = Command::new("osascript").args(["-e", &msg]).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = count;
+        let _ = Command::new("powershell")
+            .args(["-NoProfile", "-Command", "[System.Media.SystemSounds]::Asterisk.Play(); Start-Sleep -Milliseconds 1000"])
+            .creation_flags(0x0800_0000)
+            .spawn();
+    }
+}
+
 fn engine_thread(sh: Arc<Shared>) {
     let mut enigo = match Enigo::new(&Settings::default()) {
         Ok(e) => e,
@@ -131,10 +167,15 @@ fn engine_thread(sh: Arc<Shared>) {
         *sh.started.lock().unwrap() = Some(t0);
         let mut next = t0;
         let mut count: u64 = 0;
+        let limit = Duration::from_secs(cfg.limit_min as u64 * 60 + cfg.limit_sec as u64);
+        let time_up = || cfg.rep == Rep::Time && t0.elapsed() >= limit;
         while sh.running.load(Ordering::Relaxed) {
             // hedef zamana kadar bekle (uzun beklemelerde dilimlere böl)
             loop {
                 let now = Instant::now();
+                if time_up() {
+                    sh.running.store(false, Ordering::Relaxed);
+                }
                 if now >= next || !sh.running.load(Ordering::Relaxed) {
                     break;
                 }
@@ -153,20 +194,42 @@ fn engine_thread(sh: Arc<Shared>) {
                         Btn::Right => Button::Right,
                         Btn::Middle => Button::Middle,
                     };
-                    let _ = enigo.button(b, Direction::Click);
-                    if cfg.double {
-                        let _ = enigo.button(b, Direction::Click);
+                    for _ in 0..(if cfg.double { 2 } else { 1 }) {
+                        if cfg.hold_ms > 0 {
+                            let _ = enigo.button(b, Direction::Press);
+                            sleeper.sleep(Duration::from_millis(cfg.hold_ms as u64));
+                            let _ = enigo.button(b, Direction::Release);
+                        } else {
+                            let _ = enigo.button(b, Direction::Click);
+                        }
                     }
                 }
                 Mode::Keyboard => {
                     if let Some((_, k)) = keys.get(cfg.key_idx) {
-                        let _ = enigo.key(*k, Direction::Click);
+                        let mods = [Key::Control, Key::Shift, Key::Alt, Key::Meta];
+                        for (i, m) in mods.iter().enumerate() {
+                            if cfg.mods[i] {
+                                let _ = enigo.key(*m, Direction::Press);
+                            }
+                        }
+                        if cfg.hold_ms > 0 {
+                            let _ = enigo.key(*k, Direction::Press);
+                            sleeper.sleep(Duration::from_millis(cfg.hold_ms as u64));
+                            let _ = enigo.key(*k, Direction::Release);
+                        } else {
+                            let _ = enigo.key(*k, Direction::Click);
+                        }
+                        for (i, m) in mods.iter().enumerate().rev() {
+                            if cfg.mods[i] {
+                                let _ = enigo.key(*m, Direction::Release);
+                            }
+                        }
                     }
                 }
             }
             count += 1;
             sh.clicks.store(count, Ordering::Relaxed);
-            if !cfg.infinite && count >= cfg.repeat {
+            if (cfg.rep == Rep::Count && count >= cfg.repeat) || time_up() {
                 sh.running.store(false, Ordering::Relaxed);
                 break;
             }
@@ -178,6 +241,9 @@ fn engine_thread(sh: Arc<Shared>) {
         }
         sh.elapsed_ms
             .store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
+        if cfg.notify && count > 0 {
+            notify(count);
+        }
         *sh.started.lock().unwrap() = None;
     }
 }
@@ -383,7 +449,7 @@ impl eframe::App for App {
                     card(ui, "Aralık", |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 10.0;
-                            let mut field = |ui: &mut egui::Ui, v: &mut u32, max: u32, lbl: &str| {
+                            let field = |ui: &mut egui::Ui, v: &mut u32, max: u32, lbl: &str| {
                                 ui.vertical(|ui| {
                                     ui.add_sized([70.0, 30.0], egui::DragValue::new(v).range(0..=max));
                                     ui.label(egui::RichText::new(lbl).small().weak());
@@ -404,6 +470,11 @@ impl eframe::App for App {
                                     seg(ui, &mut self.cfg.btn, &[(Btn::Left, "Sol"), (Btn::Right, "Sağ"), (Btn::Middle, "Orta")]);
                                     ui.checkbox(&mut self.cfg.double, "Çift");
                                 });
+                                ui.horizontal(|ui| {
+                                    ui.label("Basılı tut");
+                                    ui.add(egui::DragValue::new(&mut self.cfg.hold_ms).range(0..=60000).suffix(" ms"));
+                                    ui.label(egui::RichText::new("0 = normal tık").small().weak());
+                                });
                                 seg(ui, &mut self.cfg.fixed_pos, &[(false, "İmleç yerinde"), (true, "Sabit konum")]);
                                 if self.cfg.fixed_pos {
                                     ui.horizontal(|ui| {
@@ -418,24 +489,45 @@ impl eframe::App for App {
                             }
                             Mode::Keyboard => {
                                 let cur = self.keys.get(self.cfg.key_idx).map(|k| k.0).unwrap_or("?");
-                                egui::ComboBox::from_id_salt("key")
-                                    .selected_text(format!("Tuş: {cur}"))
-                                    .show_ui(ui, |ui| {
-                                        for (i, (n, _)) in self.keys.iter().enumerate() {
-                                            ui.selectable_value(&mut self.cfg.key_idx, i, *n);
-                                        }
-                                    });
+                                ui.horizontal(|ui| {
+                                    let names = if cfg!(target_os = "macos") {
+                                        ["Ctrl", "Shift", "Opt", "Cmd"]
+                                    } else {
+                                        ["Ctrl", "Shift", "Alt", "Win"]
+                                    };
+                                    for (i, n) in names.iter().enumerate() {
+                                        ui.checkbox(&mut self.cfg.mods[i], *n);
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt("key")
+                                        .selected_text(format!("Tuş: {cur}"))
+                                        .show_ui(ui, |ui| {
+                                            for (i, (n, _)) in self.keys.iter().enumerate() {
+                                                ui.selectable_value(&mut self.cfg.key_idx, i, *n);
+                                            }
+                                        });
+                                    ui.add(egui::DragValue::new(&mut self.cfg.hold_ms).range(0..=60000).prefix("basılı ").suffix(" ms"));
+                                });
                             }
                         }
                     });
 
-                    card(ui, "Tekrar", |ui| {
+                    card(ui, "Bitiş", |ui| {
                         ui.horizontal(|ui| {
-                            seg(ui, &mut self.cfg.infinite, &[(true, "Sonsuz"), (false, "Sayı")]);
-                            if !self.cfg.infinite {
-                                ui.add(egui::DragValue::new(&mut self.cfg.repeat).range(1..=u64::MAX));
+                            seg(ui, &mut self.cfg.rep, &[(Rep::Infinite, "Sonsuz"), (Rep::Count, "Sayı"), (Rep::Time, "Süre")]);
+                            match self.cfg.rep {
+                                Rep::Count => {
+                                    ui.add(egui::DragValue::new(&mut self.cfg.repeat).range(1..=u64::MAX));
+                                }
+                                Rep::Time => {
+                                    ui.add(egui::DragValue::new(&mut self.cfg.limit_min).range(0..=999).suffix(" dk"));
+                                    ui.add(egui::DragValue::new(&mut self.cfg.limit_sec).range(0..=59).suffix(" sn"));
+                                }
+                                Rep::Infinite => {}
                             }
                         });
+                        ui.checkbox(&mut self.cfg.notify, "Bitince ses / bildirim");
                     });
                 });
 
@@ -509,8 +601,9 @@ fn main() -> eframe::Result {
     check_update(upd.clone());
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([380.0, 495.0])
+            .with_inner_size([380.0, 600.0])
             .with_resizable(false)
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("icon"))
             .with_always_on_top(),
         ..Default::default()
     };
