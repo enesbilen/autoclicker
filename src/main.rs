@@ -490,6 +490,7 @@ fn seg<T: PartialEq + Copy>(ui: &mut egui::Ui, val: &mut T, items: &[(T, &str)])
 }
 
 struct App {
+    _tray: Option<tray_icon::TrayIcon>,
     sh: Arc<Shared>,
     cfg: Config,
     keys: Vec<(&'static str, Key)>,
@@ -729,6 +730,45 @@ impl eframe::App for App {
     }
 }
 
+fn setup_tray(sh: Arc<Shared>, ctx: egui::Context) -> Option<tray_icon::TrayIcon> {
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    let img = image::load_from_memory(include_bytes!("../assets/icon.png")).ok()?;
+    let img = img.resize(44, 44, image::imageops::FilterType::Lanczos3).to_rgba8();
+    let (w, h) = img.dimensions();
+    let icon = tray_icon::Icon::from_rgba(img.into_raw(), w, h).ok()?;
+
+    let toggle = MenuItem::new("Başlat / Durdur", true, None);
+    let show = MenuItem::new("Pencereyi göster", true, None);
+    let quit = MenuItem::new("Çık", true, None);
+    let menu = Menu::new();
+    menu.append_items(&[&toggle, &show, &PredefinedMenuItem::separator(), &quit]).ok()?;
+    let (tid, sid, qid) = (toggle.id().clone(), show.id().clone(), quit.id().clone());
+
+    MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
+        if ev.id == tid {
+            let r = sh.running.load(Ordering::Relaxed);
+            sh.running.store(!r, Ordering::Relaxed);
+            ctx.request_repaint();
+        } else if ev.id == sid {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
+        } else if ev.id == qid {
+            sh.running.store(false, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(100));
+            std::process::exit(0);
+        }
+    }));
+
+    tray_icon::TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_icon(icon)
+        .with_tooltip("AutoClicker")
+        .build()
+        .ok()
+}
+
 fn main() -> eframe::Result {
     let sh = Arc::new(Shared {
         cfg: Mutex::new(Config::default()),
@@ -770,7 +810,9 @@ fn main() -> eframe::Result {
             style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(48);
             style.spacing.button_padding = [10.0, 4.0].into();
             cc.egui_ctx.set_style(style);
+            let _tray = setup_tray(sh.clone(), cc.egui_ctx.clone());
             Ok(Box::new(App {
+                _tray,
                 sh,
                 cfg: Config::default(),
                 keys: key_list(),

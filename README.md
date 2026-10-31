@@ -9,6 +9,10 @@ macOS ve Windows için hızlı, hafif otomatik tıklayıcı. Rust ile yazıldı,
 - Klavye otomasyonu: harf, rakam, F1–F12, Enter, Space, ok tuşları
 - Tekrar sayısı veya durdurulana kadar
 - Atanabilir başlat / durdur kısayolları (varsayılan F6, aynı tuş = aç/kapa)
+- Tıklama dizisi: birden çok konuma sırayla tıklama, adım başına bekleme
+- Basılı tutma, tuş kombinasyonları, süre sınırı, bitişte ses/bildirim
+- Menü çubuğu / sistem tepsisi: Başlat/Durdur, pencereyi göster, çık
+- Acil durdurma: imleci sol üst köşeye götür
 - Tıklama raporu: toplam tıklama, süre, ortalama tık/sn
 
 ## İndirme
