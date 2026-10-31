@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 enum Mode {
     Mouse,
     Keyboard,
+    Sequence,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -25,6 +26,14 @@ enum Btn {
     Left,
     Right,
     Middle,
+}
+
+#[derive(Clone)]
+struct Step {
+    x: i32,
+    y: i32,
+    btn: Btn,
+    delay_ms: u32,
 }
 
 #[derive(Clone)]
@@ -47,6 +56,7 @@ struct Config {
     mods: [bool; 4], // ctrl, shift, alt, meta
     hold_ms: u32,
     notify: bool,
+    steps: Vec<Step>,
 }
 
 impl Default for Config {
@@ -70,6 +80,7 @@ impl Default for Config {
             mods: [false; 4],
             hold_ms: 0,
             notify: true,
+            steps: vec![],
         }
     }
 }
@@ -94,6 +105,11 @@ struct Shared {
     stop_key: Mutex<Keycode>,
     capturing: AtomicU8, // 0 yok, 1 başlat, 2 durdur
     pos: Mutex<(i32, i32)>,
+    error: Mutex<String>,
+}
+
+fn lk<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn key_list() -> Vec<(&'static str, Key)> {
@@ -148,104 +164,182 @@ fn notify(count: u64) {
     }
 }
 
-fn engine_thread(sh: Arc<Shared>) {
-    let mut enigo = match Enigo::new(&Settings::default()) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+fn to_button(b: Btn) -> Button {
+    match b {
+        Btn::Left => Button::Left,
+        Btn::Right => Button::Right,
+        Btn::Middle => Button::Middle,
+    }
+}
+
+/// Hedef ana kadar bekler; durdurulursa veya süre dolarsa erken döner.
+fn sleep_until(sh: &Shared, sl: &spin_sleep::SpinSleeper, until: Instant, deadline: Option<Instant>) {
+    loop {
+        if !sh.running.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = Instant::now();
+        if deadline.is_some_and(|d| now >= d) {
+            sh.running.store(false, Ordering::Relaxed);
+            return;
+        }
+        if now >= until {
+            return;
+        }
+        sl.sleep((until - now).min(Duration::from_millis(20)));
+    }
+}
+
+fn click_btn(enigo: &mut Enigo, sh: &Shared, sl: &spin_sleep::SpinSleeper, b: Button, double: bool, hold_ms: u32) {
+    for _ in 0..(if double { 2 } else { 1 }) {
+        if hold_ms > 0 {
+            let _ = enigo.button(b, Direction::Press);
+            sleep_until(sh, sl, Instant::now() + Duration::from_millis(hold_ms as u64), None);
+            let _ = enigo.button(b, Direction::Release); // durdurulsa bile bırak
+        } else {
+            let _ = enigo.button(b, Direction::Click);
+        }
+    }
+}
+
+fn engine_run(sh: Arc<Shared>) {
     let keys = key_list();
     let sleeper = spin_sleep::SpinSleeper::default();
+    let mut enigo: Option<Enigo> = None;
     loop {
         if !sh.running.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(5));
             continue;
         }
-        let cfg = sh.cfg.lock().unwrap().clone();
-        let interval = Duration::from_millis(cfg.interval_ms());
-        sh.clicks.store(0, Ordering::Relaxed);
-        let t0 = Instant::now();
-        *sh.started.lock().unwrap() = Some(t0);
-        let mut next = t0;
-        let mut count: u64 = 0;
-        let limit = Duration::from_secs(cfg.limit_min as u64 * 60 + cfg.limit_sec as u64);
-        let time_up = || cfg.rep == Rep::Time && t0.elapsed() >= limit;
-        while sh.running.load(Ordering::Relaxed) {
-            // hedef zamana kadar bekle (uzun beklemelerde dilimlere böl)
-            loop {
-                let now = Instant::now();
-                if time_up() {
+        if enigo.is_none() {
+            match Enigo::new(&Settings::default()) {
+                Ok(e) => enigo = Some(e),
+                Err(e) => {
+                    *lk(&sh.error) = format!("Girdi başlatılamadı (izinleri kontrol et): {e}");
                     sh.running.store(false, Ordering::Relaxed);
+                    continue;
                 }
-                if now >= next || !sh.running.load(Ordering::Relaxed) {
-                    break;
-                }
-                sleeper.sleep((next - now).min(Duration::from_millis(20)));
-            }
-            if !sh.running.load(Ordering::Relaxed) {
-                break;
-            }
-            match cfg.mode {
-                Mode::Mouse => {
-                    if cfg.fixed_pos {
-                        let _ = enigo.move_mouse(cfg.x, cfg.y, Coordinate::Abs);
-                    }
-                    let b = match cfg.btn {
-                        Btn::Left => Button::Left,
-                        Btn::Right => Button::Right,
-                        Btn::Middle => Button::Middle,
-                    };
-                    for _ in 0..(if cfg.double { 2 } else { 1 }) {
-                        if cfg.hold_ms > 0 {
-                            let _ = enigo.button(b, Direction::Press);
-                            sleeper.sleep(Duration::from_millis(cfg.hold_ms as u64));
-                            let _ = enigo.button(b, Direction::Release);
-                        } else {
-                            let _ = enigo.button(b, Direction::Click);
-                        }
-                    }
-                }
-                Mode::Keyboard => {
-                    if let Some((_, k)) = keys.get(cfg.key_idx) {
-                        let mods = [Key::Control, Key::Shift, Key::Alt, Key::Meta];
-                        for (i, m) in mods.iter().enumerate() {
-                            if cfg.mods[i] {
-                                let _ = enigo.key(*m, Direction::Press);
-                            }
-                        }
-                        if cfg.hold_ms > 0 {
-                            let _ = enigo.key(*k, Direction::Press);
-                            sleeper.sleep(Duration::from_millis(cfg.hold_ms as u64));
-                            let _ = enigo.key(*k, Direction::Release);
-                        } else {
-                            let _ = enigo.key(*k, Direction::Click);
-                        }
-                        for (i, m) in mods.iter().enumerate().rev() {
-                            if cfg.mods[i] {
-                                let _ = enigo.key(*m, Direction::Release);
-                            }
-                        }
-                    }
-                }
-            }
-            count += 1;
-            sh.clicks.store(count, Ordering::Relaxed);
-            if (cfg.rep == Rep::Count && count >= cfg.repeat) || time_up() {
-                sh.running.store(false, Ordering::Relaxed);
-                break;
-            }
-            next += interval;
-            let now = Instant::now();
-            if next < now {
-                next = now; // geride kaldıysak yığılma yapma
             }
         }
-        sh.elapsed_ms
-            .store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
+        let enigo = enigo.as_mut().unwrap();
+        let cfg = lk(&sh.cfg).clone();
+        if cfg.mode == Mode::Sequence && cfg.steps.is_empty() {
+            *lk(&sh.error) = "Dizi boş: önce adım ekle.".into();
+            sh.running.store(false, Ordering::Relaxed);
+            continue;
+        }
+        lk(&sh.error).clear();
+        sh.clicks.store(0, Ordering::Relaxed);
+        let t0 = Instant::now();
+        *lk(&sh.started) = Some(t0);
+        let deadline = (cfg.rep == Rep::Time)
+            .then(|| t0 + Duration::from_secs(cfg.limit_min as u64 * 60 + cfg.limit_sec as u64));
+        let mut count: u64 = 0;
+        let b = to_button(cfg.btn);
+        let failsafe = |sh: &Shared| -> bool {
+            // sabit konumda değilken imleç sol üst köşedeyse acil durdur
+            let (x, y) = *lk(&sh.pos);
+            if x <= 0 && y <= 0 {
+                *lk(&sh.error) = "Acil durdurma: imleç köşeye götürüldü.".into();
+                sh.running.store(false, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        };
+
+        if cfg.mode == Mode::Sequence {
+            let mut loops: u64 = 0;
+            'outer: while sh.running.load(Ordering::Relaxed) {
+                for st in &cfg.steps {
+                    if !sh.running.load(Ordering::Relaxed) {
+                        break 'outer;
+                    }
+                    let _ = enigo.move_mouse(st.x, st.y, Coordinate::Abs);
+                    click_btn(enigo, &sh, &sleeper, to_button(st.btn), false, 0);
+                    count += 1;
+                    sh.clicks.store(count, Ordering::Relaxed);
+                    sleep_until(&sh, &sleeper, Instant::now() + Duration::from_millis(st.delay_ms as u64), deadline);
+                }
+                loops += 1;
+                if cfg.rep == Rep::Count && loops >= cfg.repeat {
+                    sh.running.store(false, Ordering::Relaxed);
+                }
+            }
+        } else {
+            let interval = Duration::from_millis(cfg.interval_ms());
+            let mut next = t0;
+            while sh.running.load(Ordering::Relaxed) {
+                sleep_until(&sh, &sleeper, next, deadline);
+                if !sh.running.load(Ordering::Relaxed) {
+                    break;
+                }
+                match cfg.mode {
+                    Mode::Mouse => {
+                        if cfg.fixed_pos {
+                            let _ = enigo.move_mouse(cfg.x, cfg.y, Coordinate::Abs);
+                        } else if failsafe(&sh) {
+                            break;
+                        }
+                        click_btn(enigo, &sh, &sleeper, b, cfg.double, cfg.hold_ms);
+                    }
+                    Mode::Keyboard => {
+                        if let Some((_, k)) = keys.get(cfg.key_idx) {
+                            let mods = [Key::Control, Key::Shift, Key::Alt, Key::Meta];
+                            for (i, m) in mods.iter().enumerate() {
+                                if cfg.mods[i] {
+                                    let _ = enigo.key(*m, Direction::Press);
+                                }
+                            }
+                            if cfg.hold_ms > 0 {
+                                let _ = enigo.key(*k, Direction::Press);
+                                sleep_until(&sh, &sleeper, Instant::now() + Duration::from_millis(cfg.hold_ms as u64), None);
+                                let _ = enigo.key(*k, Direction::Release);
+                            } else {
+                                let _ = enigo.key(*k, Direction::Click);
+                            }
+                            for (i, m) in mods.iter().enumerate().rev() {
+                                if cfg.mods[i] {
+                                    let _ = enigo.key(*m, Direction::Release);
+                                }
+                            }
+                        }
+                    }
+                    Mode::Sequence => {}
+                }
+                count += 1;
+                sh.clicks.store(count, Ordering::Relaxed);
+                if cfg.rep == Rep::Count && count >= cfg.repeat {
+                    sh.running.store(false, Ordering::Relaxed);
+                    break;
+                }
+                next += interval;
+                let now = Instant::now();
+                if next < now {
+                    next = now; // geride kaldıysak yığılma yapma
+                }
+            }
+        }
+        sh.elapsed_ms.store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
+        *lk(&sh.started) = None;
         if cfg.notify && count > 0 {
             notify(count);
         }
-        *sh.started.lock().unwrap() = None;
     }
+}
+
+/// Thread çökerse hatayı göster ve yeniden başlat; uygulama kapanmasın.
+fn supervised(sh: Arc<Shared>, name: &'static str, f: fn(Arc<Shared>)) {
+    std::thread::spawn(move || loop {
+        let s = sh.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(s)));
+        if r.is_ok() {
+            break;
+        }
+        sh.running.store(false, Ordering::Relaxed);
+        *lk(&sh.error) = format!("{name} beklenmedik şekilde durdu, yeniden başlatıldı.");
+        std::thread::sleep(Duration::from_millis(500));
+    });
 }
 
 fn hotkey_thread(sh: Arc<Shared>) {
@@ -256,20 +350,20 @@ fn hotkey_thread(sh: Arc<Shared>) {
         let keys = ds.get_keys();
         let pressed: Vec<Keycode> = keys.iter().filter(|k| !prev.contains(k)).cloned().collect();
         let (mx, my) = ds.get_mouse().coords;
-        *sh.pos.lock().unwrap() = (mx, my);
+        *lk(&sh.pos) = (mx, my);
         if !pressed.is_empty() {
             let cap = sh.capturing.load(Ordering::Relaxed);
             if cap != 0 {
                 let k = pressed[0];
                 if cap == 1 {
-                    *sh.start_key.lock().unwrap() = k;
+                    *lk(&sh.start_key) = k;
                 } else {
-                    *sh.stop_key.lock().unwrap() = k;
+                    *lk(&sh.stop_key) = k;
                 }
                 sh.capturing.store(0, Ordering::Relaxed);
             } else {
-                let sk = *sh.start_key.lock().unwrap();
-                let tk = *sh.stop_key.lock().unwrap();
+                let sk = *lk(&sh.start_key);
+                let tk = *lk(&sh.stop_key);
                 for k in &pressed {
                     if sk == tk && *k == sk {
                         let r = sh.running.load(Ordering::Relaxed);
@@ -326,7 +420,7 @@ fn check_update(st: Arc<Mutex<UpdateState>>) {
             .as_array()
             .and_then(|l| l.iter().find(|a| a["name"].as_str().unwrap_or("").ends_with(want)))
         {
-            st.lock().unwrap().available = Some(Update {
+            lk(&st).available = Some(Update {
                 version: tag,
                 url: a["browser_download_url"].as_str().unwrap_or("").to_string(),
                 name: a["name"].as_str().unwrap_or("update").to_string(),
@@ -336,7 +430,7 @@ fn check_update(st: Arc<Mutex<UpdateState>>) {
 }
 
 fn download_update(u: Update, st: Arc<Mutex<UpdateState>>) {
-    st.lock().unwrap().status = "İndiriliyor...".into();
+    lk(&st).status = "İndiriliyor...".into();
     std::thread::spawn(move || {
         let res = (|| -> Result<std::path::PathBuf, String> {
             let home = std::env::var("HOME")
@@ -358,7 +452,7 @@ fn download_update(u: Update, st: Arc<Mutex<UpdateState>>) {
             }
             Err(e) => format!("Hata: {e}"),
         };
-        st.lock().unwrap().status = msg;
+        lk(&st).status = msg;
     });
 }
 
@@ -399,22 +493,30 @@ struct App {
     sh: Arc<Shared>,
     cfg: Config,
     keys: Vec<(&'static str, Key)>,
-    pick_at: Option<Instant>,
+    pick_at: Option<(Instant, bool)>, // (zaman, yeni adım mı)
     upd: Arc<Mutex<UpdateState>>,
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.sh.running.store(false, Ordering::Relaxed);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(50));
         let running = self.sh.running.load(Ordering::Relaxed);
         let cap = self.sh.capturing.load(Ordering::Relaxed);
 
-        if let Some(t) = self.pick_at {
+        if let Some((t, new_step)) = self.pick_at {
             if Instant::now() >= t {
-                let (x, y) = *self.sh.pos.lock().unwrap();
-                self.cfg.x = x;
-                self.cfg.y = y;
-                self.cfg.fixed_pos = true;
+                let (x, y) = *lk(&self.sh.pos);
+                if new_step {
+                    self.cfg.steps.push(Step { x, y, btn: Btn::Left, delay_ms: 500 });
+                } else {
+                    self.cfg.x = x;
+                    self.cfg.y = y;
+                    self.cfg.fixed_pos = true;
+                }
                 self.pick_at = None;
             }
         }
@@ -424,9 +526,9 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
 
-                let upd = self.upd.lock().unwrap().available.clone();
+                let upd = lk(&self.upd).available.clone();
                 if let Some(u) = upd {
-                    let status = self.upd.lock().unwrap().status.clone();
+                    let status = lk(&self.upd).status.clone();
                     egui::Frame::none()
                         .fill(ACCENT.gamma_multiply(0.25))
                         .rounding(8.0)
@@ -446,6 +548,7 @@ impl eframe::App for App {
                 }
 
                 ui.add_enabled_ui(!running, |ui| {
+                    if self.cfg.mode != Mode::Sequence {
                     card(ui, "Aralık", |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 10.0;
@@ -461,9 +564,10 @@ impl eframe::App for App {
                             field(ui, &mut self.cfg.ms, 999, "salise (ms)");
                         });
                     });
+                    }
 
                     card(ui, "Tıklama", |ui| {
-                        seg(ui, &mut self.cfg.mode, &[(Mode::Mouse, "Fare"), (Mode::Keyboard, "Klavye")]);
+                        seg(ui, &mut self.cfg.mode, &[(Mode::Mouse, "Fare"), (Mode::Keyboard, "Klavye"), (Mode::Sequence, "Dizi")]);
                         match self.cfg.mode {
                             Mode::Mouse => {
                                 ui.horizontal(|ui| {
@@ -482,10 +586,49 @@ impl eframe::App for App {
                                         ui.add(egui::DragValue::new(&mut self.cfg.y).prefix("Y "));
                                         let lbl = if self.pick_at.is_some() { "Hedefe götür…" } else { "Seç (3 sn)" };
                                         if ui.button(lbl).clicked() {
-                                            self.pick_at = Some(Instant::now() + Duration::from_secs(3));
+                                            self.pick_at = Some((Instant::now() + Duration::from_secs(3), false));
                                         }
                                     });
                                 }
+                            }
+                            Mode::Sequence => {
+                                let mut del: Option<usize> = None;
+                                egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                    for (i, st) in self.cfg.steps.iter_mut().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("{}", i + 1));
+                                            ui.add(egui::DragValue::new(&mut st.x).prefix("x "));
+                                            ui.add(egui::DragValue::new(&mut st.y).prefix("y "));
+                                            let name = match st.btn {
+                                                Btn::Left => "Sol",
+                                                Btn::Right => "Sağ",
+                                                Btn::Middle => "Orta",
+                                            };
+                                            egui::ComboBox::from_id_salt(("btn", i)).width(44.0).selected_text(name).show_ui(ui, |ui| {
+                                                ui.selectable_value(&mut st.btn, Btn::Left, "Sol");
+                                                ui.selectable_value(&mut st.btn, Btn::Right, "Sağ");
+                                                ui.selectable_value(&mut st.btn, Btn::Middle, "Orta");
+                                            });
+                                            ui.add(egui::DragValue::new(&mut st.delay_ms).range(0..=3_600_000).suffix(" ms"));
+                                            if ui.small_button("✕").clicked() {
+                                                del = Some(i);
+                                            }
+                                        });
+                                    }
+                                });
+                                if let Some(i) = del {
+                                    self.cfg.steps.remove(i);
+                                }
+                                ui.horizontal(|ui| {
+                                    let lbl = if self.pick_at.is_some() { "İmleci hedefe götür…" } else { "+ Adım ekle (3 sn)" };
+                                    if ui.button(lbl).clicked() {
+                                        self.pick_at = Some((Instant::now() + Duration::from_secs(3), true));
+                                    }
+                                    if !self.cfg.steps.is_empty() && ui.button("Temizle").clicked() {
+                                        self.cfg.steps.clear();
+                                    }
+                                });
+                                ui.label(egui::RichText::new("Her adım: konuma git, tıkla, ms kadar bekle.").small().weak());
                             }
                             Mode::Keyboard => {
                                 let cur = self.keys.get(self.cfg.key_idx).map(|k| k.0).unwrap_or("?");
@@ -532,8 +675,8 @@ impl eframe::App for App {
                 });
 
                 card(ui, "Kısayollar", |ui| {
-                    let sk = format!("{:?}", *self.sh.start_key.lock().unwrap());
-                    let tk = format!("{:?}", *self.sh.stop_key.lock().unwrap());
+                    let sk = format!("{:?}", *lk(&self.sh.start_key));
+                    let tk = format!("{:?}", *lk(&self.sh.stop_key));
                     ui.horizontal(|ui| {
                         ui.label("Başlat");
                         let t = if cap == 1 { "tuşa bas…".to_string() } else { sk };
@@ -547,10 +690,17 @@ impl eframe::App for App {
                             self.sh.capturing.store(2, Ordering::Relaxed);
                         }
                     });
+                    if self.cfg.mode == Mode::Mouse && !self.cfg.fixed_pos {
+                        ui.label(egui::RichText::new("Acil durdurma: imleci ekranın sol üst köşesine götür.").small().weak());
+                    }
                 });
 
                 if !running {
-                    *self.sh.cfg.lock().unwrap() = self.cfg.clone();
+                    *lk(&self.sh.cfg) = self.cfg.clone();
+                }
+                let err = lk(&self.sh.error).clone();
+                if !err.is_empty() {
+                    ui.colored_label(RED, err);
                 }
                 let (txt, col) = if running { ("■  Durdur", RED) } else { ("▶  Başlat", GREEN) };
                 let b = egui::Button::new(egui::RichText::new(txt).size(16.0).strong().color(egui::Color32::WHITE))
@@ -561,7 +711,7 @@ impl eframe::App for App {
                 }
 
                 let clicks = self.sh.clicks.load(Ordering::Relaxed);
-                let el = match *self.sh.started.lock().unwrap() {
+                let el = match *lk(&self.sh.started) {
                     Some(t) => t.elapsed().as_millis() as u64,
                     None => self.sh.elapsed_ms.load(Ordering::Relaxed),
                 };
@@ -589,13 +739,14 @@ fn main() -> eframe::Result {
         start_key: Mutex::new(Keycode::F6),
         stop_key: Mutex::new(Keycode::F6),
         capturing: AtomicU8::new(0),
-        pos: Mutex::new((0, 0)),
+        pos: Mutex::new((1, 1)),
+        error: Mutex::new(String::new()),
     });
     {
         let s = sh.clone();
-        std::thread::spawn(move || engine_thread(s));
+        supervised(s, "Motor", engine_run);
         let s = sh.clone();
-        std::thread::spawn(move || hotkey_thread(s));
+        supervised(s, "Kısayol dinleyici", hotkey_thread);
     }
     let upd = Arc::new(Mutex::new(UpdateState::default()));
     check_update(upd.clone());

@@ -1,6 +1,6 @@
 [package]
 name = "autoclicker"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [dependencies]
@@ -15,7 +15,6 @@ serde_json = "1"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = true
 
 [target.'cfg(windows)'.build-dependencies]
