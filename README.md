@@ -1,29 +1,40 @@
 # AutoClicker
 
-macOS ve Windows için hızlı, hafif otomatik tıklayıcı. Rust ile yazıldı, tek çalıştırılabilir dosya.
+macOS (Apple Silicon) ve Windows (x64) için hızlı, hafif otomatik tıklayıcı. Rust ile yazıldı.
 
 ## Özellikler
 
-- Saat / dakika / saniye / salise (ms) cinsinden aralık (en düşük 1 ms)
-- Fare otomasyonu: sol, sağ, orta düğme, çift tık, imleç konumu veya sabit koordinat
-- Klavye otomasyonu: harf, rakam, F1–F12, Enter, Space, ok tuşları
-- Tekrar sayısı veya durdurulana kadar
-- Atanabilir başlat / durdur kısayolları (varsayılan F6, aynı tuş = aç/kapa)
-- Tıklama dizisi: birden çok konuma sırayla tıklama, adım başına bekleme
-- Basılı tutma, tuş kombinasyonları, süre sınırı, bitişte ses/bildirim
-- Menü çubuğu / sistem tepsisi: Başlat/Durdur, pencereyi göster, çık
-- Acil durdurma: imleci sol üst köşeye götür
-- Tıklama raporu: toplam tıklama, süre, ortalama tık/sn
+- **Aralık:** saat / dakika / saniye / salise (ms), en düşük 1 ms
+- **Fare:** sol, sağ, orta düğme, çift tık, imleç konumu veya sabit koordinat
+- **Klavye:** harf, rakam, F1–F12, Enter, Space, ok tuşları; Ctrl / Shift / Alt(Opt) / Win(Cmd) kombinasyonları
+- **Basılı tutma:** fare düğmesi veya tuşu belirlediğin ms kadar basılı tutar
+- **Tıklama dizisi:** birden çok konuma sırayla tıklama, her adım için düğme ve bekleme süresi
+- **Bitiş:** durdurulana kadar, belirli sayıda (dizide döngü sayısı) veya süre sınırı (ör. 5 dk)
+- **Bildirim:** iş bitince ses (macOS'ta ayrıca bildirim)
+- **Kısayollar:** başlat ve durdur için tuş ataması (varsayılan F6; aynı tuş = aç/kapa)
+- **Menü çubuğu / sistem tepsisi:** Başlat/Durdur, pencereyi göster, çık
+- **Acil durdurma:** fare modunda imleci ekranın sol üst köşesine götür
+- **Rapor:** toplam tıklama, süre, ortalama tık/sn
+- **Güncelleme kontrolü:** yeni sürüm varsa uygulama içinde haber verir, **Güncelle** ile indirip açar
 
-## İndirme
+## Kurulum
 
-[Releases](../../releases) sayfasından işletim sistemine uygun dosyayı indir.
+[Releases](../../releases) sayfasından son sürümü indir.
+
+**macOS:** `AutoClicker-macos-arm64.dmg` dosyasını aç, `AutoClicker.app`'i Applications'a sürükle.
+Uygulama henüz imzasız olduğu için ilk açılışta engellenirse uygulamaya sağ tıklayıp **Aç** de, ya da:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/AutoClicker.app
+```
+
+**Windows:** `AutoClicker-windows-x64.exe` dosyasını çalıştır. SmartScreen uyarısı çıkarsa
+**Ek bilgi → Yine de çalıştır** de.
 
 ## macOS izinleri
 
-İlk çalıştırmada **Sistem Ayarları → Gizlilik ve Güvenlik** altında uygulamaya (veya Terminal'e)
-**Erişilebilirlik** ve **Girdi İzleme** izni ver. Bu izinler olmadan tıklama ve kısayollar çalışmaz.
-İlk açılışta engellenirse uygulamaya sağ tıklayıp **Aç** de veya `xattr -dr com.apple.quarantine /Applications/AutoClicker.app` çalıştır.
+**Sistem Ayarları → Gizlilik ve Güvenlik** altında uygulamaya **Erişilebilirlik** ve **Girdi İzleme**
+izni ver. Bu izinler olmadan tıklama ve kısayollar çalışmaz. İzni verdikten sonra uygulamayı yeniden başlat.
 
 ## Kaynaktan derleme
 
@@ -34,9 +45,11 @@ cargo run --release
 
 ## Release oluşturma
 
+`Cargo.toml` içindeki `version` değerini güncelle, sonra etiket at:
+
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
-GitHub Actions macOS (Apple Silicon) ile Windows sürümlerini derleyip Releases'e ekler.
+GitHub Actions macOS (Apple Silicon, `.dmg`) ve Windows (`.exe`) sürümlerini derleyip Releases'e ekler.
