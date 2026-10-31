@@ -9,6 +9,7 @@ macOS (Apple Silicon) ve Windows (x64) için hızlı, hafif otomatik tıklayıc�
 - **Klavye:** harf, rakam, F1–F12, Enter, Space, ok tuşları; Ctrl / Shift / Alt(Opt) / Win(Cmd) kombinasyonları
 - **Basılı tutma:** fare düğmesi veya tuşu belirlediğin ms kadar basılı tutar
 - **Tıklama dizisi:** birden çok konuma sırayla tıklama, her adım için düğme ve bekleme süresi
+- **Kayıt:** tıklamalarını kaydedip Dizi olarak aktarır (aralarındaki süreler dahil)
 - **Bitiş:** durdurulana kadar, belirli sayıda (dizide döngü sayısı) veya süre sınırı (ör. 5 dk)
 - **Bildirim:** iş bitince ses (macOS'ta ayrıca bildirim)
 - **Kısayollar:** başlat ve durdur için tuş ataması (varsayılan F6; aynı tuş = aç/kapa)

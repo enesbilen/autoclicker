@@ -12,6 +12,7 @@ enum Mode {
     Mouse,
     Keyboard,
     Sequence,
+    Record,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -106,6 +107,9 @@ struct Shared {
     capturing: AtomicU8, // 0 yok, 1 başlat, 2 durdur
     pos: Mutex<(i32, i32)>,
     error: Mutex<String>,
+    recording: AtomicBool,
+    rec: Mutex<Vec<Step>>,
+    rec_last: Mutex<Option<Instant>>,
 }
 
 fn lk<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -211,6 +215,16 @@ fn engine_run(sh: Arc<Shared>) {
             std::thread::sleep(Duration::from_millis(5));
             continue;
         }
+        if lk(&sh.cfg).mode == Mode::Record {
+            sh.running.store(false, Ordering::Relaxed);
+            let r = sh.recording.load(Ordering::Relaxed);
+            if !r {
+                lk(&sh.rec).clear();
+                *lk(&sh.rec_last) = None;
+            }
+            sh.recording.store(!r, Ordering::Relaxed);
+            continue;
+        }
         if enigo.is_none() {
             match Enigo::new(&Settings::default()) {
                 Ok(e) => enigo = Some(e),
@@ -305,7 +319,7 @@ fn engine_run(sh: Arc<Shared>) {
                             }
                         }
                     }
-                    Mode::Sequence => {}
+                    Mode::Sequence | Mode::Record => {}
                 }
                 count += 1;
                 sh.clicks.store(count, Ordering::Relaxed);
@@ -345,12 +359,31 @@ fn supervised(sh: Arc<Shared>, name: &'static str, f: fn(Arc<Shared>)) {
 fn hotkey_thread(sh: Arc<Shared>) {
     let ds = DeviceState::new();
     let mut prev: Vec<Keycode> = vec![];
+    let mut prev_btn = [false; 3];
     loop {
         std::thread::sleep(Duration::from_millis(8));
         let keys = ds.get_keys();
         let pressed: Vec<Keycode> = keys.iter().filter(|k| !prev.contains(k)).cloned().collect();
-        let (mx, my) = ds.get_mouse().coords;
+        let ms = ds.get_mouse();
+        let (mx, my) = ms.coords;
         *lk(&sh.pos) = (mx, my);
+        let cur = [1usize, 2, 3].map(|i| ms.button_pressed.get(i).copied().unwrap_or(false));
+        if sh.recording.load(Ordering::Relaxed) {
+            for (i, b) in [Btn::Left, Btn::Right, Btn::Middle].iter().enumerate() {
+                if cur[i] && !prev_btn[i] {
+                    let now = Instant::now();
+                    let last = *lk(&sh.rec_last);
+                    let mut r = lk(&sh.rec);
+                    if let (Some(t), Some(l)) = (last, r.last_mut()) {
+                        l.delay_ms = now.duration_since(t).as_millis().min(3_600_000) as u32;
+                    }
+                    r.push(Step { x: mx, y: my, btn: *b, delay_ms: 500 });
+                    drop(r);
+                    *lk(&sh.rec_last) = Some(now);
+                }
+            }
+        }
+        prev_btn = cur;
         if !pressed.is_empty() {
             let cap = sh.capturing.load(Ordering::Relaxed);
             if cap != 0 {
@@ -382,9 +415,6 @@ fn hotkey_thread(sh: Arc<Shared>) {
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REPO: &str = "enesbilen/autoclicker";
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(79, 140, 255);
-const GREEN: egui::Color32 = egui::Color32::from_rgb(46, 160, 90);
-const RED: egui::Color32 = egui::Color32::from_rgb(214, 69, 65);
 
 #[derive(Clone)]
 struct Update {
@@ -456,37 +486,173 @@ fn download_update(u: Update, st: Arc<Mutex<UpdateState>>) {
     });
 }
 
-fn card(ui: &mut egui::Ui, title: &str, f: impl FnOnce(&mut egui::Ui)) {
+// ---------- Tema ----------
+use egui::{Color32, FontId, RichText, Stroke, Vec2};
+
+const BG: Color32 = Color32::from_rgb(11, 13, 18);
+const CARD: Color32 = Color32::from_rgb(18, 21, 28);
+const BORDER: Color32 = Color32::from_rgb(33, 38, 50);
+const TRACK: Color32 = Color32::from_rgb(9, 11, 15);
+const TXT: Color32 = Color32::from_rgb(232, 235, 242);
+const DIM: Color32 = Color32::from_rgb(140, 147, 163);
+const GREEN: Color32 = Color32::from_rgb(16, 185, 129);
+const BLUE: Color32 = Color32::from_rgb(59, 130, 246);
+const AMBER: Color32 = Color32::from_rgb(245, 158, 11);
+const RED: Color32 = Color32::from_rgb(239, 68, 68);
+
+#[derive(Clone, Copy)]
+enum Tone {
+    Gray,
+    Blue,
+    Amber,
+}
+
+fn apply_style(ctx: &egui::Context) {
+    let mut st = (*ctx.style()).clone();
+    st.visuals = egui::Visuals::dark();
+    st.visuals.panel_fill = BG;
+    st.visuals.window_fill = CARD;
+    st.visuals.selection.bg_fill = BLUE;
+    st.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    for w in [
+        &mut st.visuals.widgets.inactive,
+        &mut st.visuals.widgets.hovered,
+        &mut st.visuals.widgets.active,
+    ] {
+        w.rounding = 8.0.into();
+    }
+    st.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(30, 34, 44);
+    st.visuals.widgets.inactive.bg_fill = Color32::from_rgb(30, 34, 44);
+    st.spacing.item_spacing = Vec2::new(8.0, 6.0);
+    st.spacing.button_padding = Vec2::new(10.0, 5.0);
+    ctx.set_style(st);
+}
+
+fn dot(ui: &mut egui::Ui, color: Color32) {
+    let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+    ui.painter().circle_filled(r.center(), 4.0, color);
+}
+
+fn card(ui: &mut egui::Ui, color: Color32, title: &str, right: Option<String>, f: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none()
-        .fill(egui::Color32::from_gray(34))
-        .rounding(10.0)
+        .fill(CARD)
+        .stroke(Stroke::new(1.0_f32, BORDER))
+        .rounding(16.0)
         .inner_margin(12.0)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(egui::RichText::new(title.to_uppercase()).size(10.5).weak());
-            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                dot(ui, color);
+                ui.label(RichText::new(title).size(12.5).strong().color(Color32::from_rgb(205, 210, 222)));
+                if let Some(r) = right {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(r).monospace().size(12.0).color(DIM));
+                    });
+                }
+            });
+            ui.add_space(4.0);
             f(ui);
         });
 }
 
-fn seg<T: PartialEq + Copy>(ui: &mut egui::Ui, val: &mut T, items: &[(T, &str)]) {
-    ui.horizontal(|ui| {
+fn seg<T: PartialEq + Copy>(ui: &mut egui::Ui, val: &mut T, items: &[(T, &str)], tone: Tone) {
+    let (fill, stroke, txt) = match tone {
+        Tone::Gray => (Color32::from_rgb(42, 46, 56), Color32::from_rgb(78, 84, 98), Color32::WHITE),
+        Tone::Blue => (Color32::from_rgb(18, 38, 78), BLUE, Color32::from_rgb(140, 185, 255)),
+        Tone::Amber => (Color32::from_rgb(58, 41, 10), AMBER, AMBER),
+    };
+    egui::Frame::none().fill(TRACK).rounding(12.0).inner_margin(4.0).show(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        for (v, label) in items {
-            let sel = *val == *v;
-            let b = egui::Button::new(egui::RichText::new(*label).color(if sel {
-                egui::Color32::WHITE
-            } else {
-                egui::Color32::from_gray(190)
-            }))
-            .fill(if sel { ACCENT } else { egui::Color32::from_gray(48) })
-            .rounding(6.0)
-            .min_size([0.0, 26.0].into());
-            if ui.add(b).clicked() {
-                *val = *v;
+        let n = items.len() as f32;
+        let w = ((ui.available_width() - 4.0 * (n - 1.0)) / n).floor();
+        ui.horizontal(|ui| {
+            for (v, label) in items {
+                let sel = *val == *v;
+                let b = egui::Button::new(RichText::new(*label).size(14.0).color(if sel { txt } else { DIM }))
+                    .fill(if sel { fill } else { Color32::TRANSPARENT })
+                    .stroke(if sel { Stroke::new(1.0_f32, stroke) } else { Stroke::NONE })
+                    .rounding(9.0);
+                if ui.add_sized([w, 32.0], b).clicked() {
+                    *val = *v;
+                }
             }
-        }
+        });
     });
+}
+
+fn field(ui: &mut egui::Ui, v: &mut u32, max: u32, label: &str, hot: bool) {
+    let w = ui.available_width();
+    egui::Frame::none()
+        .fill(TRACK)
+        .stroke(Stroke::new(1.0_f32, if hot { Color32::from_rgb(10, 110, 80) } else { BORDER }))
+        .rounding(12.0)
+        .show(ui, |ui| {
+            let st = ui.style_mut();
+            st.override_font_id = Some(FontId::monospace(22.0));
+            st.visuals.override_text_color = Some(if hot { GREEN } else { Color32::WHITE });
+            for wv in [&mut st.visuals.widgets.inactive, &mut st.visuals.widgets.hovered, &mut st.visuals.widgets.active] {
+                wv.weak_bg_fill = Color32::TRANSPARENT;
+                wv.bg_fill = Color32::TRANSPARENT;
+                wv.bg_stroke = Stroke::NONE;
+            }
+            ui.add_sized([w - 2.0, 44.0], egui::DragValue::new(v).range(0..=max));
+        });
+    ui.vertical_centered(|ui| {
+        ui.label(RichText::new(label).color(if hot { GREEN } else { DIM }));
+    });
+}
+
+fn hold_row(ui: &mut egui::Ui, hold: &mut u32) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(RichText::new("Basılı Tutma Süresi").size(15.0).color(TXT));
+            ui.label(RichText::new("0 ms = anlık standart tıklama").size(12.5).color(DIM));
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new("ms").color(DIM));
+            egui::Frame::none().fill(TRACK).stroke(Stroke::new(1.0_f32, BORDER)).rounding(10.0).show(ui, |ui| {
+                let st = ui.style_mut();
+                st.override_font_id = Some(FontId::monospace(16.0));
+                for wv in [&mut st.visuals.widgets.inactive, &mut st.visuals.widgets.hovered, &mut st.visuals.widgets.active] {
+                    wv.weak_bg_fill = Color32::TRANSPARENT;
+                    wv.bg_fill = Color32::TRANSPARENT;
+                    wv.bg_stroke = Stroke::NONE;
+                }
+                ui.add_sized([86.0, 32.0], egui::DragValue::new(hold).range(0..=60000));
+            });
+        });
+    });
+}
+
+fn small_btn(ui: &mut egui::Ui, text: &str) -> bool {
+    ui.add(egui::Button::new(RichText::new(text).size(13.0).color(TXT)).fill(Color32::from_rgb(30, 34, 44)).rounding(8.0))
+        .clicked()
+}
+
+fn big_button(ui: &mut egui::Ui, label: &str, chip: &str, fill: Color32, text: Color32) -> bool {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 54.0), egui::Sense::click());
+    let fill = if resp.hovered() { fill.gamma_multiply(1.12) } else { fill };
+    ui.painter().rect_filled(rect, 16.0, fill);
+    let g = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(19.0), text);
+    let c = ui.painter().layout_no_wrap(chip.to_string(), FontId::monospace(13.0), text);
+    let chip_w = c.size().x + 18.0;
+    let total = g.size().x + 14.0 + chip_w;
+    let x0 = rect.center().x - total / 2.0;
+    let gp = egui::pos2(x0, rect.center().y - g.size().y / 2.0);
+    ui.painter().galley(gp, g.clone(), text);
+    let chip_rect = egui::Rect::from_min_size(
+        egui::pos2(x0 + g.size().x + 14.0, rect.center().y - 12.0),
+        Vec2::new(chip_w, 24.0),
+    );
+    ui.painter().rect_filled(chip_rect, 7.0, Color32::from_black_alpha(40));
+    ui.painter().galley(
+        egui::pos2(chip_rect.center().x - c.size().x / 2.0, chip_rect.center().y - c.size().y / 2.0),
+        c,
+        text,
+    );
+    resp.clicked()
 }
 
 struct App {
@@ -496,17 +662,120 @@ struct App {
     keys: Vec<(&'static str, Key)>,
     pick_at: Option<(Instant, bool)>, // (zaman, yeni adım mı)
     upd: Arc<Mutex<UpdateState>>,
+    icon: Option<egui::TextureHandle>,
+    settings_open: bool,
+    pinned: bool,
+    was_rec: bool,
+    frames: u32,
+}
+
+impl App {
+    fn finish_record(&mut self, pop_last: bool) {
+        self.sh.recording.store(false, Ordering::Relaxed);
+        let mut r = lk(&self.sh.rec).clone();
+        if pop_last {
+            r.pop(); // durdur düğmesine yapılan tık
+        }
+        if let Some(l) = r.last_mut() {
+            l.delay_ms = 500;
+        }
+        if !r.is_empty() {
+            self.cfg.steps = r;
+            self.cfg.mode = Mode::Sequence;
+        }
+        self.was_rec = false;
+    }
+
+    fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            if let Some(t) = &self.icon {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(t.id(), Vec2::splat(26.0))));
+            }
+            ui.label(RichText::new("AutoClicker").size(17.0).strong().color(TXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let pin_col = if self.pinned { GREEN } else { DIM };
+                if ui
+                    .add(egui::Button::new(RichText::new("📌").size(16.0).color(pin_col)).frame(false))
+                    .on_hover_text("Her zaman üstte")
+                    .clicked()
+                {
+                    self.pinned = !self.pinned;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.pinned {
+                        egui::WindowLevel::AlwaysOnTop
+                    } else {
+                        egui::WindowLevel::Normal
+                    }));
+                }
+                let gear = if self.settings_open { GREEN } else { DIM };
+                if ui
+                    .add(egui::Button::new(RichText::new("⚙").size(17.0).color(gear)).frame(false))
+                    .on_hover_text("Ayarlar")
+                    .clicked()
+                {
+                    self.settings_open = !self.settings_open;
+                }
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(8, 40, 33))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(10, 100, 75)))
+                    .rounding(14.0)
+                    .inner_margin(egui::Margin::symmetric(10.0, 3.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("v{VERSION}")).monospace().size(12.5).color(GREEN));
+                            dot(ui, GREEN);
+                        });
+                    });
+            });
+        });
+    }
+
+    fn settings_view(&mut self, ui: &mut egui::Ui) {
+        let cap = self.sh.capturing.load(Ordering::Relaxed);
+        card(ui, GREEN, "KISAYOL TUŞLARI", None, |ui| {
+            let sk = format!("{:?}", *lk(&self.sh.start_key));
+            let tk = format!("{:?}", *lk(&self.sh.stop_key));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Başlat").color(TXT));
+                if small_btn(ui, &if cap == 1 { "tuşa bas…".to_string() } else { sk }) {
+                    self.sh.capturing.store(1, Ordering::Relaxed);
+                }
+                ui.add_space(10.0);
+                ui.label(RichText::new("Durdur").color(TXT));
+                if small_btn(ui, &if cap == 2 { "tuşa bas…".to_string() } else { tk }) {
+                    self.sh.capturing.store(2, Ordering::Relaxed);
+                }
+            });
+            ui.label(RichText::new("Başlat ve durdur aynı tuşsa aç/kapa olarak çalışır.").size(12.5).color(DIM));
+        });
+        card(ui, BLUE, "HAKKINDA", None, |ui| {
+            ui.label(RichText::new(format!("AutoClicker v{VERSION}")).color(TXT));
+            let u = lk(&self.upd).available.clone();
+            match u {
+                Some(u) => ui.label(RichText::new(format!("Yeni sürüm var: {}", u.version)).color(GREEN)),
+                None => ui.label(RichText::new("Güncel sürümü kullanıyorsun.").color(DIM)),
+            };
+            ui.label(RichText::new("github.com/enesbilen/autoclicker").size(12.5).color(DIM));
+        });
+        card(ui, AMBER, "ACİL DURDURMA", None, |ui| {
+            ui.label(RichText::new("Fare modunda (sabit konum kapalıyken) imleci ekranın sol üst köşesine götür.").size(13.0).color(DIM));
+        });
+    }
 }
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.sh.running.store(false, Ordering::Relaxed);
+        self.sh.recording.store(false, Ordering::Relaxed);
     }
 
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(50));
         let running = self.sh.running.load(Ordering::Relaxed);
-        let cap = self.sh.capturing.load(Ordering::Relaxed);
+        let recording = self.sh.recording.load(Ordering::Relaxed);
+        if self.was_rec && !recording {
+            self.finish_record(false);
+        }
+        self.was_rec = recording;
 
         if let Some((t, new_step)) = self.pick_at {
             if Instant::now() >= t {
@@ -521,194 +790,74 @@ impl eframe::App for App {
                 self.pick_at = None;
             }
         }
+        if !running {
+            *lk(&self.sh.cfg) = self.cfg.clone();
+        }
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::from_gray(22)).inner_margin(14.0))
+        // ---- Üst: başlık + sekmeler + güncelleme bandı
+        egui::TopBottomPanel::top("top")
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 12.0, bottom: 8.0 }))
             .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 8.0;
-
+                self.header(ui, ctx);
+                ui.add_space(4.0);
+                ui.add_enabled_ui(!running && !recording, |ui| {
+                    seg(
+                        ui,
+                        &mut self.cfg.mode,
+                        &[(Mode::Mouse, "Fare"), (Mode::Keyboard, "Klavye"), (Mode::Sequence, "Dizi"), (Mode::Record, "Kayıt")],
+                        Tone::Gray,
+                    );
+                });
                 let upd = lk(&self.upd).available.clone();
                 if let Some(u) = upd {
                     let status = lk(&self.upd).status.clone();
-                    egui::Frame::none()
-                        .fill(ACCENT.gamma_multiply(0.25))
-                        .rounding(8.0)
-                        .inner_margin(8.0)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label(format!("Yeni sürüm: {}", u.version));
-                                if status.is_empty() && ui.button("Güncelle").clicked() {
-                                    download_update(u.clone(), self.upd.clone());
-                                }
-                            });
-                            if !status.is_empty() {
-                                ui.label(egui::RichText::new(status).small());
-                            }
-                        });
-                }
-
-                ui.add_enabled_ui(!running, |ui| {
-                    if self.cfg.mode != Mode::Sequence {
-                    card(ui, "Aralık", |ui| {
+                    egui::Frame::none().fill(Color32::from_rgb(8, 40, 33)).rounding(10.0).inner_margin(8.0).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 10.0;
-                            let field = |ui: &mut egui::Ui, v: &mut u32, max: u32, lbl: &str| {
-                                ui.vertical(|ui| {
-                                    ui.add_sized([70.0, 30.0], egui::DragValue::new(v).range(0..=max));
-                                    ui.label(egui::RichText::new(lbl).small().weak());
-                                });
-                            };
-                            field(ui, &mut self.cfg.h, 99, "saat");
-                            field(ui, &mut self.cfg.m, 59, "dakika");
-                            field(ui, &mut self.cfg.s, 59, "saniye");
-                            field(ui, &mut self.cfg.ms, 999, "salise (ms)");
-                        });
-                    });
-                    }
-
-                    card(ui, "Tıklama", |ui| {
-                        seg(ui, &mut self.cfg.mode, &[(Mode::Mouse, "Fare"), (Mode::Keyboard, "Klavye"), (Mode::Sequence, "Dizi")]);
-                        match self.cfg.mode {
-                            Mode::Mouse => {
-                                ui.horizontal(|ui| {
-                                    seg(ui, &mut self.cfg.btn, &[(Btn::Left, "Sol"), (Btn::Right, "Sağ"), (Btn::Middle, "Orta")]);
-                                    ui.checkbox(&mut self.cfg.double, "Çift");
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Basılı tut");
-                                    ui.add(egui::DragValue::new(&mut self.cfg.hold_ms).range(0..=60000).suffix(" ms"));
-                                    ui.label(egui::RichText::new("0 = normal tık").small().weak());
-                                });
-                                seg(ui, &mut self.cfg.fixed_pos, &[(false, "İmleç yerinde"), (true, "Sabit konum")]);
-                                if self.cfg.fixed_pos {
-                                    ui.horizontal(|ui| {
-                                        ui.add(egui::DragValue::new(&mut self.cfg.x).prefix("X "));
-                                        ui.add(egui::DragValue::new(&mut self.cfg.y).prefix("Y "));
-                                        let lbl = if self.pick_at.is_some() { "Hedefe götür…" } else { "Seç (3 sn)" };
-                                        if ui.button(lbl).clicked() {
-                                            self.pick_at = Some((Instant::now() + Duration::from_secs(3), false));
-                                        }
-                                    });
-                                }
-                            }
-                            Mode::Sequence => {
-                                let mut del: Option<usize> = None;
-                                egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                                    for (i, st) in self.cfg.steps.iter_mut().enumerate() {
-                                        ui.horizontal(|ui| {
-                                            ui.label(format!("{}", i + 1));
-                                            ui.add(egui::DragValue::new(&mut st.x).prefix("x "));
-                                            ui.add(egui::DragValue::new(&mut st.y).prefix("y "));
-                                            let name = match st.btn {
-                                                Btn::Left => "Sol",
-                                                Btn::Right => "Sağ",
-                                                Btn::Middle => "Orta",
-                                            };
-                                            egui::ComboBox::from_id_salt(("btn", i)).width(44.0).selected_text(name).show_ui(ui, |ui| {
-                                                ui.selectable_value(&mut st.btn, Btn::Left, "Sol");
-                                                ui.selectable_value(&mut st.btn, Btn::Right, "Sağ");
-                                                ui.selectable_value(&mut st.btn, Btn::Middle, "Orta");
-                                            });
-                                            ui.add(egui::DragValue::new(&mut st.delay_ms).range(0..=3_600_000).suffix(" ms"));
-                                            if ui.small_button("✕").clicked() {
-                                                del = Some(i);
-                                            }
-                                        });
-                                    }
-                                });
-                                if let Some(i) = del {
-                                    self.cfg.steps.remove(i);
-                                }
-                                ui.horizontal(|ui| {
-                                    let lbl = if self.pick_at.is_some() { "İmleci hedefe götür…" } else { "+ Adım ekle (3 sn)" };
-                                    if ui.button(lbl).clicked() {
-                                        self.pick_at = Some((Instant::now() + Duration::from_secs(3), true));
-                                    }
-                                    if !self.cfg.steps.is_empty() && ui.button("Temizle").clicked() {
-                                        self.cfg.steps.clear();
-                                    }
-                                });
-                                ui.label(egui::RichText::new("Her adım: konuma git, tıkla, ms kadar bekle.").small().weak());
-                            }
-                            Mode::Keyboard => {
-                                let cur = self.keys.get(self.cfg.key_idx).map(|k| k.0).unwrap_or("?");
-                                ui.horizontal(|ui| {
-                                    let names = if cfg!(target_os = "macos") {
-                                        ["Ctrl", "Shift", "Opt", "Cmd"]
-                                    } else {
-                                        ["Ctrl", "Shift", "Alt", "Win"]
-                                    };
-                                    for (i, n) in names.iter().enumerate() {
-                                        ui.checkbox(&mut self.cfg.mods[i], *n);
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    egui::ComboBox::from_id_salt("key")
-                                        .selected_text(format!("Tuş: {cur}"))
-                                        .show_ui(ui, |ui| {
-                                            for (i, (n, _)) in self.keys.iter().enumerate() {
-                                                ui.selectable_value(&mut self.cfg.key_idx, i, *n);
-                                            }
-                                        });
-                                    ui.add(egui::DragValue::new(&mut self.cfg.hold_ms).range(0..=60000).prefix("basılı ").suffix(" ms"));
-                                });
-                            }
-                        }
-                    });
-
-                    card(ui, "Bitiş", |ui| {
-                        ui.horizontal(|ui| {
-                            seg(ui, &mut self.cfg.rep, &[(Rep::Infinite, "Sonsuz"), (Rep::Count, "Sayı"), (Rep::Time, "Süre")]);
-                            match self.cfg.rep {
-                                Rep::Count => {
-                                    ui.add(egui::DragValue::new(&mut self.cfg.repeat).range(1..=u64::MAX));
-                                }
-                                Rep::Time => {
-                                    ui.add(egui::DragValue::new(&mut self.cfg.limit_min).range(0..=999).suffix(" dk"));
-                                    ui.add(egui::DragValue::new(&mut self.cfg.limit_sec).range(0..=59).suffix(" sn"));
-                                }
-                                Rep::Infinite => {}
+                            ui.label(RichText::new(format!("Yeni sürüm: {}", u.version)).color(GREEN));
+                            if status.is_empty() && small_btn(ui, "Güncelle") {
+                                download_update(u.clone(), self.upd.clone());
                             }
                         });
-                        ui.checkbox(&mut self.cfg.notify, "Bitince ses / bildirim");
-                    });
-                });
-
-                card(ui, "Kısayollar", |ui| {
-                    let sk = format!("{:?}", *lk(&self.sh.start_key));
-                    let tk = format!("{:?}", *lk(&self.sh.stop_key));
-                    ui.horizontal(|ui| {
-                        ui.label("Başlat");
-                        let t = if cap == 1 { "tuşa bas…".to_string() } else { sk };
-                        if ui.button(t).clicked() {
-                            self.sh.capturing.store(1, Ordering::Relaxed);
-                        }
-                        ui.add_space(8.0);
-                        ui.label("Durdur");
-                        let t = if cap == 2 { "tuşa bas…".to_string() } else { tk };
-                        if ui.button(t).clicked() {
-                            self.sh.capturing.store(2, Ordering::Relaxed);
+                        if !status.is_empty() {
+                            ui.label(RichText::new(status).size(12.0).color(DIM));
                         }
                     });
-                    if self.cfg.mode == Mode::Mouse && !self.cfg.fixed_pos {
-                        ui.label(egui::RichText::new("Acil durdurma: imleci ekranın sol üst köşesine götür.").small().weak());
-                    }
-                });
-
-                if !running {
-                    *lk(&self.sh.cfg) = self.cfg.clone();
                 }
+            });
+
+        // ---- Alt: Başlat düğmesi + istatistik
+        egui::TopBottomPanel::bottom("bottom")
+            .frame(
+                egui::Frame::none()
+                    .fill(BG)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 12.0, bottom: 10.0 }),
+            )
+            .show(ctx, |ui| {
                 let err = lk(&self.sh.error).clone();
                 if !err.is_empty() {
-                    ui.colored_label(RED, err);
+                    ui.label(RichText::new(err).size(12.5).color(RED));
                 }
-                let (txt, col) = if running { ("■  Durdur", RED) } else { ("▶  Başlat", GREEN) };
-                let b = egui::Button::new(egui::RichText::new(txt).size(16.0).strong().color(egui::Color32::WHITE))
-                    .fill(col)
-                    .rounding(10.0);
-                if ui.add_sized([ui.available_width(), 44.0], b).clicked() {
-                    self.sh.running.store(!running, Ordering::Relaxed);
+                let chip = format!("{:?}", *lk(&self.sh.start_key));
+                let dark = Color32::from_rgb(4, 36, 26);
+                if self.cfg.mode == Mode::Record {
+                    if recording {
+                        if big_button(ui, "■  Kaydı Bitir", &chip, RED, Color32::WHITE) {
+                            self.finish_record(true);
+                        }
+                    } else if big_button(ui, "●  Kaydı Başlat", &chip, GREEN, dark) {
+                        lk(&self.sh.rec).clear();
+                        *lk(&self.sh.rec_last) = None;
+                        self.sh.recording.store(true, Ordering::Relaxed);
+                        self.was_rec = true;
+                    }
+                } else if running {
+                    if big_button(ui, "■  Durdur", &chip, RED, Color32::WHITE) {
+                        self.sh.running.store(false, Ordering::Relaxed);
+                    }
+                } else if big_button(ui, "▶  Başlat", &chip, GREEN, dark) {
+                    self.sh.running.store(true, Ordering::Relaxed);
                 }
 
                 let clicks = self.sh.clicks.load(Ordering::Relaxed);
@@ -719,14 +868,209 @@ impl eframe::App for App {
                 let cps = if el > 0 { clicks as f64 * 1000.0 / el as f64 } else { 0.0 };
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("{clicks} tık  ·  {:.1} sn  ·  {cps:.1}/sn", el as f64 / 1000.0))
-                            .color(if running { ACCENT } else { egui::Color32::GRAY }),
+                        RichText::new(format!("{clicks} tık  •  {:.1} sn  •  {cps:.1}/sn", el as f64 / 1000.0))
+                            .monospace()
+                            .size(13.0)
+                            .color(if running { GREEN } else { TXT }),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new(format!("v{VERSION}")).small().weak());
+                        ui.label(RichText::new("AUTOCLICKER ENGINE").size(11.0).color(Color32::from_rgb(95, 102, 118)));
                     });
                 });
             });
+
+        // ---- Orta: içerik
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 4.0, bottom: 4.0 }))
+            .show(ctx, |ui| {
+                self.frames = self.frames.saturating_add(1);
+                let mut sa = egui::ScrollArea::vertical().auto_shrink([false, false]);
+                if self.frames < 6 {
+                    sa = sa.vertical_scroll_offset(0.0);
+                }
+                sa.show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 10.0;
+                    if self.settings_open {
+                        self.settings_view(ui);
+                        return;
+                    }
+                    ui.add_enabled_ui(!running && !recording, |ui| {
+                        self.content(ui);
+                    });
+                    ui.add_space(4.0);
+                });
+            });
+    }
+}
+
+impl App {
+    fn content(&mut self, ui: &mut egui::Ui) {
+        let mode = self.cfg.mode;
+
+        // Aralık (Fare / Klavye)
+        if mode == Mode::Mouse || mode == Mode::Keyboard {
+            let rate = 1000.0 / self.cfg.interval_ms() as f64;
+            card(ui, GREEN, "ARALIK (ZAMAN AŞIMI)", Some(format!("{rate:.0} tık/sn")), |ui| {
+                ui.columns(4, |c| {
+                    field(&mut c[0], &mut self.cfg.h, 99, "saat", false);
+                    field(&mut c[1], &mut self.cfg.m, 59, "dakika", false);
+                    field(&mut c[2], &mut self.cfg.s, 59, "saniye", false);
+                    field(&mut c[3], &mut self.cfg.ms, 999, "salise (ms)", true);
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(RichText::new("Hızlı Seçim:").color(DIM));
+                    let cur = self.cfg.interval_ms();
+                    for (ms, label) in [(1u64, "1\nms"), (20, "20\nms"), (100, "100\nms"), (500, "500\nms"), (1000, "1\nsn")] {
+                        let sel = cur == ms;
+                        let b = egui::Button::new(RichText::new(label).size(12.0).color(if sel { GREEN } else { DIM }))
+                            .fill(if sel { Color32::from_rgb(12, 44, 38) } else { Color32::from_rgb(26, 30, 40) })
+                            .stroke(Stroke::new(1.0_f32, if sel { Color32::from_rgb(10, 110, 80) } else { BORDER }))
+                            .rounding(9.0);
+                        if ui.add_sized([42.0, 38.0], b).clicked() {
+                            self.cfg.h = 0;
+                            self.cfg.m = 0;
+                            self.cfg.s = (ms / 1000) as u32;
+                            self.cfg.ms = (ms % 1000) as u32;
+                        }
+                    }
+                });
+            });
+        }
+
+        match mode {
+            Mode::Mouse => card(ui, BLUE, "TIKLAMA PARAMETRELERİ", None, |ui| {
+                ui.columns(2, |c| {
+                    c[0].label(RichText::new("Fare Düğmesi").color(DIM));
+                    seg(&mut c[0], &mut self.cfg.btn, &[(Btn::Left, "Sol"), (Btn::Right, "Sağ"), (Btn::Middle, "Orta")], Tone::Blue);
+                    c[1].label(RichText::new("Tıklama Tipi").color(DIM));
+                    seg(&mut c[1], &mut self.cfg.double, &[(false, "Tek"), (true, "Çift Tık")], Tone::Gray);
+                });
+                hold_row(ui, &mut self.cfg.hold_ms);
+                ui.separator();
+                ui.label(RichText::new("Tıklama Konumu").color(DIM));
+                seg(ui, &mut self.cfg.fixed_pos, &[(false, "İmleç Yerinde"), (true, "Sabit Konum")], Tone::Blue);
+                if self.cfg.fixed_pos {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut self.cfg.x).prefix("X "));
+                        ui.add(egui::DragValue::new(&mut self.cfg.y).prefix("Y "));
+                        let lbl = if self.pick_at.is_some() { "Hedefe götür…" } else { "Seç (3 sn)" };
+                        if small_btn(ui, lbl) {
+                            self.pick_at = Some((Instant::now() + Duration::from_secs(3), false));
+                        }
+                    });
+                }
+            }),
+            Mode::Keyboard => card(ui, BLUE, "KLAVYE PARAMETRELERİ", None, |ui| {
+                ui.label(RichText::new("Değiştirici tuşlar").color(DIM));
+                ui.horizontal(|ui| {
+                    let names = if cfg!(target_os = "macos") {
+                        ["Ctrl", "Shift", "Opt", "Cmd"]
+                    } else {
+                        ["Ctrl", "Shift", "Alt", "Win"]
+                    };
+                    for (i, n) in names.iter().enumerate() {
+                        let on = self.cfg.mods[i];
+                        let b = egui::Button::new(RichText::new(*n).color(if on { Color32::from_rgb(140, 185, 255) } else { DIM }))
+                            .fill(if on { Color32::from_rgb(18, 38, 78) } else { TRACK })
+                            .stroke(Stroke::new(1.0_f32, if on { BLUE } else { BORDER }))
+                            .rounding(9.0);
+                        if ui.add_sized([62.0, 32.0], b).clicked() {
+                            self.cfg.mods[i] = !on;
+                        }
+                    }
+                });
+                let cur = self.keys.get(self.cfg.key_idx).map(|k| k.0).unwrap_or("?");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Basılacak tuş").color(DIM));
+                    egui::ComboBox::from_id_salt("key").selected_text(cur).show_ui(ui, |ui| {
+                        for (i, (n, _)) in self.keys.iter().enumerate() {
+                            ui.selectable_value(&mut self.cfg.key_idx, i, *n);
+                        }
+                    });
+                });
+                hold_row(ui, &mut self.cfg.hold_ms);
+            }),
+            Mode::Sequence => card(ui, BLUE, "TIKLAMA DİZİSİ", Some(format!("{} adım", self.cfg.steps.len())), |ui| {
+                let mut del: Option<usize> = None;
+                egui::ScrollArea::vertical().max_height(260.0).auto_shrink([true, true]).show(ui, |ui| {
+                    for (i, st) in self.cfg.steps.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{}", i + 1)).monospace().color(DIM));
+                            ui.add(egui::DragValue::new(&mut st.x).prefix("x "));
+                            ui.add(egui::DragValue::new(&mut st.y).prefix("y "));
+                            let name = match st.btn {
+                                Btn::Left => "Sol",
+                                Btn::Right => "Sağ",
+                                Btn::Middle => "Orta",
+                            };
+                            egui::ComboBox::from_id_salt(("btn", i)).width(44.0).selected_text(name).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut st.btn, Btn::Left, "Sol");
+                                ui.selectable_value(&mut st.btn, Btn::Right, "Sağ");
+                                ui.selectable_value(&mut st.btn, Btn::Middle, "Orta");
+                            });
+                            ui.add(egui::DragValue::new(&mut st.delay_ms).range(0..=3_600_000).suffix(" ms"));
+                            if ui.small_button("✕").clicked() {
+                                del = Some(i);
+                            }
+                        });
+                    }
+                });
+                if let Some(i) = del {
+                    self.cfg.steps.remove(i);
+                }
+                ui.horizontal(|ui| {
+                    let lbl = if self.pick_at.is_some() { "İmleci hedefe götür…" } else { "+ Adım ekle (3 sn)" };
+                    if small_btn(ui, lbl) {
+                        self.pick_at = Some((Instant::now() + Duration::from_secs(3), true));
+                    }
+                    if !self.cfg.steps.is_empty() && small_btn(ui, "Temizle") {
+                        self.cfg.steps.clear();
+                    }
+                });
+                ui.label(RichText::new("Her adım: konuma git, tıkla, ms kadar bekle. Kayıt sekmesinden de oluşturabilirsin.").size(12.5).color(DIM));
+            }),
+            Mode::Record => card(ui, RED, "TIKLAMA KAYDI", None, |ui| {
+                ui.label(RichText::new("Kaydı başlat, sonra tıklamak istediğin yerlere sırayla tıkla. Bitirince adımlar Dizi sekmesine aktarılır; aralarındaki süreler de kaydedilir.").color(DIM));
+                ui.label(RichText::new(format!("Kaydedilen: {} tıklama", lk(&self.sh.rec).len())).monospace().color(TXT));
+                ui.label(RichText::new("Kaydı kısayol tuşuyla bitirirsen son tıklama silinmez.").size(12.5).color(DIM));
+            }),
+        }
+
+        // Bitiş kuralı
+        if mode != Mode::Record {
+            card(ui, AMBER, "BİTİŞ KURALI", None, |ui| {
+                seg(
+                    ui,
+                    &mut self.cfg.rep,
+                    &[(Rep::Infinite, "Sonsuz"), (Rep::Count, "Sayı Sınırı"), (Rep::Time, "Zaman")],
+                    Tone::Amber,
+                );
+                match self.cfg.rep {
+                    Rep::Count => {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut self.cfg.repeat).range(1..=u64::MAX));
+                            ui.label(RichText::new(if mode == Mode::Sequence { "döngü" } else { "tıklama" }).color(DIM));
+                        });
+                    }
+                    Rep::Time => {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut self.cfg.limit_min).range(0..=999).suffix(" dk"));
+                            ui.add(egui::DragValue::new(&mut self.cfg.limit_sec).range(0..=59).suffix(" sn"));
+                        });
+                    }
+                    Rep::Infinite => {}
+                }
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("🔔").color(TXT));
+                    ui.label(RichText::new("Bitince ses ve sistem bildirimi ver").color(TXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.checkbox(&mut self.cfg.notify, "");
+                    });
+                });
+            });
+        }
     }
 }
 
@@ -781,6 +1125,9 @@ fn main() -> eframe::Result {
         capturing: AtomicU8::new(0),
         pos: Mutex::new((1, 1)),
         error: Mutex::new(String::new()),
+        recording: AtomicBool::new(false),
+        rec: Mutex::new(vec![]),
+        rec_last: Mutex::new(None),
     });
     {
         let s = sh.clone();
@@ -792,24 +1139,23 @@ fn main() -> eframe::Result {
     check_update(upd.clone());
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([380.0, 600.0])
-            .with_resizable(false)
-            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("icon"))
-            .with_always_on_top(),
+            .with_title("AutoClicker")
+            .with_inner_size([400.0, 830.0])
+            .with_min_inner_size([400.0, 640.0])
+            .with_always_on_top()
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("icon")),
         ..Default::default()
     };
     eframe::run_native(
-        "Auto Clicker",
+        "AutoClicker",
         opts,
         Box::new(move |cc| {
-            let mut style = (*cc.egui_ctx.style()).clone();
-            style.visuals.selection.bg_fill = ACCENT;
-            style.visuals.widgets.inactive.rounding = 6.0.into();
-            style.visuals.widgets.hovered.rounding = 6.0.into();
-            style.visuals.widgets.active.rounding = 6.0.into();
-            style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(48);
-            style.spacing.button_padding = [10.0, 4.0].into();
-            cc.egui_ctx.set_style(style);
+            apply_style(&cc.egui_ctx);
+            let icon = image::load_from_memory(include_bytes!("../assets/icon.png")).ok().map(|im| {
+                let im = im.resize(64, 64, image::imageops::FilterType::Lanczos3).to_rgba8();
+                let ci = egui::ColorImage::from_rgba_unmultiplied([64, 64], im.as_raw());
+                cc.egui_ctx.load_texture("icon", ci, egui::TextureOptions::LINEAR)
+            });
             let _tray = setup_tray(sh.clone(), cc.egui_ctx.clone());
             Ok(Box::new(App {
                 _tray,
@@ -818,6 +1164,11 @@ fn main() -> eframe::Result {
                 keys: key_list(),
                 pick_at: None,
                 upd,
+                icon,
+                settings_open: false,
+                pinned: true,
+                was_rec: false,
+                frames: 0,
             }))
         }),
     )
