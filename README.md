@@ -35,4 +35,4 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-GitHub Actions macOS (Apple Silicon ve Intel) ile Windows sürümlerini derleyip Releases'e ekler.
+GitHub Actions macOS (Apple Silicon) ile Windows sürümlerini derleyip Releases'e ekler.
